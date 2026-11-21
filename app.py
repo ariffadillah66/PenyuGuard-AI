@@ -33,13 +33,14 @@ def estimate_age_and_stage(species_key, length_cm):
     if L_inf is None:
         return common_name, None, "Data parameter jurnal tidak tersedia", "Tidak dapat diklasifikasi"
 
+    length_cm = float(length_cm)
     t0 = (1.0 / K) * math.log(1.0 - (L0 / L_inf))
 
     if length_cm >= L_inf:
         age_years = None
         age_text = f"Dewasa (Mencapai batas asimtotik {L_inf} cm)"
     else:
-        age_years = max(0.1, round(t0 - (1.0 / K) * math.log(1.0 - (length_cm / L_inf)), 1))
+        age_years = float(max(0.1, round(t0 - (1.0 / K) * math.log(1.0 - (length_cm / L_inf)), 1)))
         age_text = f"± {age_years} tahun"
 
     if length_cm < 15:
@@ -78,15 +79,15 @@ def detect_aruco_scale(image_bgr, marker_real_cm):
 
         if ids is not None and len(corners) > 0:
             c = corners[0][0]
-            side1 = np.linalg.norm(c[0] - c[1])
-            side2 = np.linalg.norm(c[1] - c[2])
-            side3 = np.linalg.norm(c[2] - c[3])
-            side4 = np.linalg.norm(c[3] - c[0])
+            side1 = float(np.linalg.norm(c[0] - c[1]))
+            side2 = float(np.linalg.norm(c[1] - c[2]))
+            side3 = float(np.linalg.norm(c[2] - c[3]))
+            side4 = float(np.linalg.norm(c[3] - c[0]))
             avg_side_px = (side1 + side2 + side3 + side4) / 4.0
 
-            cm_per_pixel = float(marker_real_cm) / avg_side_px
+            cm_per_pixel = float(marker_real_cm) / float(avg_side_px)
             cv2.aruco.drawDetectedMarkers(image_bgr, corners, ids)
-            return cm_per_pixel, True
+            return float(cm_per_pixel), True
 
     return None, False
 
@@ -96,7 +97,8 @@ def run_inference_bgr(image_bgr, marker_size_cm=10.0):
     total_img_area = img_h * img_w
     marker_size_cm = float(marker_size_cm) if marker_size_cm and marker_size_cm > 0 else 10.0
 
-    cm_per_pixel, marker_found = detect_aruco_scale(image_bgr, marker_size_cm)
+    annotated_bgr = image_bgr.copy()
+    cm_per_pixel, marker_found = detect_aruco_scale(annotated_bgr, marker_size_cm)
     results = model.predict(image_bgr, conf=0.75, verbose=False)[0]
 
     valid_boxes = []
@@ -106,7 +108,6 @@ def run_inference_bgr(image_bgr, marker_size_cm=10.0):
         if (box_area / total_img_area) >= 0.02:
             valid_boxes.append(box)
 
-    annotated_bgr = image_bgr.copy()
     turtles = []
 
     for box in valid_boxes:
@@ -115,8 +116,8 @@ def run_inference_bgr(image_bgr, marker_size_cm=10.0):
         conf = float(box.conf[0])
 
         x1, y1, x2, y2 = box.xyxy[0].tolist()
-        width_px = x2 - x1
-        height_px = y2 - y1
+        width_px = float(x2 - x1)
+        height_px = float(y2 - y1)
 
         cv2.rectangle(annotated_bgr, (int(x1), int(y1)), (int(x2), int(y2)), (16, 185, 129), 3)
         cv2.putText(
@@ -136,9 +137,9 @@ def run_inference_bgr(image_bgr, marker_size_cm=10.0):
         age_text = "Memerlukan marker ArUco"
         stage = "Memerlukan marker ArUco"
 
-        if marker_found:
+        if marker_found and cm_per_pixel is not None:
             max_px = max(width_px, height_px)
-            est_length_cm = round(max_px * cm_per_pixel, 2)
+            est_length_cm = float(round(max_px * float(cm_per_pixel), 2))
             _, age_years, age_text, stage = estimate_age_and_stage(cls_name, est_length_cm)
 
         turtles.append({
@@ -146,7 +147,7 @@ def run_inference_bgr(image_bgr, marker_size_cm=10.0):
             "common_name": common_name,
             "scientific_name": sci_name,
             "nama_id": f"{common_name} ({sci_name})",
-            "confidence": round(conf, 4),
+            "confidence": round(float(conf), 4),
             "est_length_cm": est_length_cm,
             "age_years": age_years,
             "est_age": age_text,
@@ -154,7 +155,6 @@ def run_inference_bgr(image_bgr, marker_size_cm=10.0):
         })
 
     return annotated_bgr, marker_found, cm_per_pixel, turtles
-
 
 def analyze_turtle_gradio(image_rgb, marker_size_cm):
     if image_rgb is None:
