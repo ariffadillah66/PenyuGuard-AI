@@ -1,8 +1,13 @@
+import base64
 import math
 import os
 import cv2
 import gradio as gr
 import numpy as np
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from ultralytics import YOLO
 
 # Muat model hasil training
@@ -10,36 +15,32 @@ model = YOLO("best.pt")
 
 # Parameter Von Bertalanffy (Ramirez et al., 2021 - Tabel 3 Model D)
 SPECIES_INFO = {
-    "green": ("Penyu Hijau (Chelonia mydas)", 110.27, 0.051, 5.0),
-    "loggerhead": ("Penyu Tempayan (Caretta caretta)", 100.06, 0.066, 4.5),
-    "hawksbill": ("Penyu Sisik (Eretmochelys imbricata)", 84.63, 0.113, 4.2),
-    "OliveRidley": ("Penyu Lekang (Lepidochelys olivacea)", 81.52, 0.127, 4.2),
-    "KempsRidley": ("Penyu Kemp's Ridley (Lepidochelys kempii)", 69.97, 0.198, 4.0),
-    "leatherback": ("Penyu Belimbing (Dermochelys coriacea)", None, None, None),
+    "green": ("Penyu Hijau", "Chelonia mydas", 110.27, 0.051, 5.0),
+    "loggerhead": ("Penyu Tempayan", "Caretta caretta", 100.06, 0.066, 4.5),
+    "hawksbill": ("Penyu Sisik", "Eretmochelys imbricata", 84.63, 0.113, 4.2),
+    "OliveRidley": ("Penyu Lekang", "Lepidochelys olivacea", 81.52, 0.127, 4.2),
+    "KempsRidley": ("Penyu Kemp's Ridley", "Lepidochelys kempii", 69.97, 0.198, 4.0),
+    "leatherback": ("Penyu Belimbing", "Dermochelys coriacea", None, None, None),
 }
 
 
 def estimate_age_and_stage(species_key, length_cm):
     info = SPECIES_INFO.get(species_key)
     if not info:
-        return "Spesies Tidak Dikenal", None, "-"
+        return "Spesies Tidak Dikenal", None, None, "-"
 
-    nama_id, L_inf, K, L0 = info
-
+    common_name, sci_name, L_inf, K, L0 = info
     if L_inf is None:
-        return (
-            nama_id,
-            "Data parameter jurnal tidak tersedia",
-            "Tidak dapat diklasifikasi",
-        )
+        return common_name, None, "Data parameter jurnal tidak tersedia", "Tidak dapat diklasifikasi"
 
     t0 = (1.0 / K) * math.log(1.0 - (L0 / L_inf))
 
     if length_cm >= L_inf:
+        age_years = None
         age_text = f"Dewasa (Mencapai batas asimtotik {L_inf} cm)"
     else:
-        age_years = t0 - (1.0 / K) * math.log(1.0 - (length_cm / L_inf))
-        age_text = f"± {max(0.1, round(age_years, 1))} tahun"
+        age_years = max(0.1, round(t0 - (1.0 / K) * math.log(1.0 - (length_cm / L_inf)), 1))
+        age_text = f"± {age_years} tahun"
 
     if length_cm < 15:
         stage = "Tukik (Hatchling)"
@@ -50,7 +51,7 @@ def estimate_age_and_stage(species_key, length_cm):
     else:
         stage = "Dewasa (Adult)"
 
-    return nama_id, age_text, stage
+    return common_name, age_years, age_text, stage
 
 
 def detect_aruco_scale(image_bgr, marker_real_cm):
@@ -83,20 +84,17 @@ def detect_aruco_scale(image_bgr, marker_real_cm):
             side4 = np.linalg.norm(c[3] - c[0])
             avg_side_px = (side1 + side2 + side3 + side4) / 4.0
 
-            cm_per_pixel = marker_real_cm / avg_side_px
+            cm_per_pixel = float(marker_real_cm) / avg_side_px
             cv2.aruco.drawDetectedMarkers(image_bgr, corners, ids)
             return cm_per_pixel, True
 
     return None, False
 
 
-def analyze_turtle(image_rgb, marker_size_cm):
-    if image_rgb is None:
-        return None, "Silakan unggah, ambil via webcam, atau paste foto penyu terlebih dahulu."
-
-    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+def run_inference_bgr(image_bgr, marker_size_cm=10.0):
     img_h, img_w, _ = image_bgr.shape
     total_img_area = img_h * img_w
+    marker_size_cm = float(marker_size_cm) if marker_size_cm and marker_size_cm > 0 else 10.0
 
     cm_per_pixel, marker_found = detect_aruco_scale(image_bgr, marker_size_cm)
     results = model.predict(image_bgr, conf=0.75, verbose=False)[0]
@@ -109,92 +107,145 @@ def analyze_turtle(image_rgb, marker_size_cm):
             valid_boxes.append(box)
 
     annotated_bgr = image_bgr.copy()
+    turtles = []
 
-    if len(valid_boxes) == 0:
-        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-        return annotated_rgb, (
-            "⚠️ **Objek Bukan Penyu atau Gambar Tidak Jelas.**\n\nTidak ditemukan"
-            " penyu yang memenuhi standar keyakinan minimal (≥ 75%). Pastikan objek"
-            " utama di dalam foto adalah penyu laut."
-        )
-
-    report_lines = []
-    if marker_found:
-        report_lines.append(
-            f"✅ **Kalibrasi ArUco Berhasil** (Skala: {cm_per_pixel:.4f} cm/piksel)\n"
-        )
-    else:
-        report_lines.append(
-            "ℹ️ **Mode Identifikasi Spesies (Tanpa Marker ArUco)**\n*Sertakan"
-            " marker ArUco di samping penyu jika ingin menghitung panjang karapas"
-            " dan estimasi usia.*\n"
-        )
-
-    for i, box in enumerate(valid_boxes):
+    for box in valid_boxes:
         cls_id = int(box.cls[0])
         cls_name = model.names[cls_id]
-        conf = float(box.conf[0]) * 100
+        conf = float(box.conf[0])
 
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         width_px = x2 - x1
         height_px = y2 - y1
 
-        cv2.rectangle(
-            annotated_bgr, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3
-        )
+        cv2.rectangle(annotated_bgr, (int(x1), int(y1)), (int(x2), int(y2)), (16, 185, 129), 3)
         cv2.putText(
             annotated_bgr,
-            f"{cls_name} {conf:.1f}%",
-            (int(x1), int(y1) - 10),
+            f"{cls_name} {conf * 100:.1f}%",
+            (int(x1), max(24, int(y1) - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0),
+            (16, 185, 129),
             2,
         )
 
-        nama_id = SPECIES_INFO.get(cls_name, (cls_name, None, None, None))[0]
-        report_lines.append(f"### Penyu #{i+1}")
-        report_lines.append(f"* **Spesies:** {nama_id} *(Keyakinan: {conf:.1f}%)*")
+        info = SPECIES_INFO.get(cls_name, (cls_name, cls_name, None, None, None))
+        common_name, sci_name = info[0], info[1]
+        est_length_cm = None
+        age_years = None
+        age_text = "Memerlukan marker ArUco"
+        stage = "Memerlukan marker ArUco"
 
         if marker_found:
             max_px = max(width_px, height_px)
             est_length_cm = round(max_px * cm_per_pixel, 2)
-            _, est_age, stage = estimate_age_and_stage(cls_name, est_length_cm)
+            _, age_years, age_text, stage = estimate_age_and_stage(cls_name, est_length_cm)
 
-            report_lines.append(f"* **Estimasi Panjang Karapas:** {est_length_cm} cm")
-            report_lines.append(f"* **Estimasi Usia (VBGF):** {est_age}")
-            report_lines.append(f"* **Fase Hidup:** {stage}\n")
-        else:
-            report_lines.append("* **Estimasi Panjang Karapas:** *Memerlukan marker*")
-            report_lines.append("* **Estimasi Usia (VBGF):** *Memerlukan marker*\n")
+        turtles.append({
+            "species_key": cls_name,
+            "common_name": common_name,
+            "scientific_name": sci_name,
+            "nama_id": f"{common_name} ({sci_name})",
+            "confidence": round(conf, 4),
+            "est_length_cm": est_length_cm,
+            "age_years": age_years,
+            "est_age": age_text,
+            "stage": stage,
+        })
 
+    return annotated_bgr, marker_found, cm_per_pixel, turtles
+
+
+def analyze_turtle_gradio(image_rgb, marker_size_cm):
+    if image_rgb is None:
+        return None, "Silakan unggah, ambil via webcam, atau paste foto penyu terlebih dahulu."
+
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    annotated_bgr, marker_found, cm_per_pixel, turtles = run_inference_bgr(image_bgr, marker_size_cm)
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    return annotated_rgb, "\n".join(report_lines)
+
+    if len(turtles) == 0:
+        return annotated_rgb, (
+            "⚠️ **Objek Bukan Penyu atau Gambar Tidak Jelas.**\n\n"
+            "Tidak ditemukan penyu dengan keyakinan minimal (≥ 75%)."
+        )
+
+    lines = []
+    if marker_found:
+        lines.append(f"✅ **Kalibrasi ArUco Berhasil** (Skala: {cm_per_pixel:.4f} cm/piksel)\n")
+    else:
+        lines.append("ℹ️ **Mode Identifikasi Spesies (Tanpa Marker ArUco)**\n")
+
+    for i, t in enumerate(turtles):
+        lines.append(f"### Penyu #{i+1}")
+        lines.append(f"* **Spesies:** {t['nama_id']} *(Keyakinan: {t['confidence']*100:.1f}%)*")
+        lines.append(f"* **Estimasi Panjang Karapas:** {t['est_length_cm']} cm" if marker_found else "* **Estimasi Panjang Karapas:** *Memerlukan marker*")
+        lines.append(f"* **Estimasi Usia (VBGF):** {t['est_age']}")
+        lines.append(f"* **Fase Hidup:** {t['stage']}\n")
+
+    return annotated_rgb, "\n".join(lines)
 
 
+# Antarmuka Gradio (tetap tersedia di root URL)
 demo = gr.Interface(
-    fn=analyze_turtle,
+    fn=analyze_turtle_gradio,
     inputs=[
-        gr.Image(
-            sources=["upload", "webcam", "clipboard"],
-            type="numpy",
-            label="Unggah, Ambil via Webcam, atau Paste Foto Penyu",
-        ),
+        gr.Image(sources=["upload", "webcam", "clipboard"], type="numpy", label="Foto Penyu"),
         gr.Number(value=10.0, label="Ukuran Fisik Sisi ArUco Marker (cm)"),
     ],
     outputs=[
         gr.Image(label="Hasil Deteksi & Kalibrasi"),
-        gr.Markdown(label="Laporan Biometrik Penyu (Pulau Rinca - PKM-RE)"),
+        gr.Markdown(label="Laporan Biometrik Penyu"),
     ],
     title="Sistem Identifikasi & Morfometri Penyu Laut",
-    description=(
-        "Deteksi spesies penyu otomatis, serta estimasi panjang karapas dan"
-        " usia pertumbuhan Von Bertalanffy (Ramirez et al., 2021) jika"
-        " terkalibrasi ArUco Marker."
-    ),
 )
+
+# FastAPI + CORS agar bisa diakses langsung oleh website PenyuGuard
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class AnalyzeRequest(BaseModel):
+    image: str
+    marker_size_cm: float = 10.0
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "online", "model": "YOLOv8n + ArUco + VBGF"}
+
+
+@app.post("/api/analyze")
+def analyze_api(req: AnalyzeRequest):
+    img_data = req.image.split(",", 1)[1] if "," in req.image else req.image
+    nparr = np.frombuffer(base64.b64decode(img_data), np.uint8)
+    image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if image_bgr is None:
+        return {"status": "error", "message": "Gambar tidak dapat dibaca."}
+
+    annotated_bgr, marker_found, cm_per_pixel, turtles = run_inference_bgr(image_bgr, req.marker_size_cm)
+    _, buffer = cv2.imencode(".jpg", annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    annotated_b64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
+
+    return {
+        "status": "ok",
+        "detected": len(turtles) > 0,
+        "marker_found": marker_found,
+        "cm_per_pixel": round(cm_per_pixel, 4) if cm_per_pixel else None,
+        "annotated_image": annotated_b64,
+        "turtles": turtles,
+    }
+
+
+app = gr.mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
-    
+    uvicorn.run(app, host="0.0.0.0", port=port)
